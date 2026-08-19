@@ -1,0 +1,29 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Model / HuggingFace cache (large, re-downloaded on each machine)
+.cache/
+*.pt
+*.pth
+*.onnx
+
+# Temp files
+/tmp/
+*.mp4
+*.tmp
+
+# Env / secrets
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
