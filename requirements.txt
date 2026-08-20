@@ -6,3 +6,8 @@ opencv-python-headless
 numpy
 torch
 transformers
+passlib[bcrypt]
+bcrypt<4.1
+python-jose[cryptography]
+requests
+python-dotenv
