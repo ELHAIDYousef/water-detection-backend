@@ -1,28 +1,32 @@
 """
-Water Detection Backend — standalone FastAPI app (CPU or GPU).
+Water Detection Backend — complete standalone FastAPI app (CPU or GPU).
 
-Same logic as the Colab notebook, packaged as a real app you can run anywhere
-(your laptop, or an AWS EC2 instance). No ngrok needed — when this runs on EC2,
-the instance already has a public address.
+Features:
+  - POST /detect/image           single-image detection (sync)
+  - POST /detect/video           video detection (async job)
+  - GET  /jobs/{job_id}          poll a video job
+  - GET  /cameras                45 simulated cameras + live status (round-robin worker)
+  - GET  /cameras/{id}/frame     latest annotated frame for one camera (JPEG)
+  - GET  /cameras/{id}/video     raw source video for one camera (no overlay)
+  - GET  /events                 overflow event log (SQLite, newest first)
 
-Run locally:   uvicorn main:app --host 0.0.0.0 --port 8000
-Then point the dashboard's config.js BASE_URL at:  http://localhost:8000
-On EC2, use:   http://<EC2-PUBLIC-IP>:8000
+Run:  uvicorn main:app --host 0.0.0.0 --port 8000
+Cameras read videos from a ./videos folder next to this file.
 """
 
-import os, io, uuid, base64, threading, time
+import os, io, uuid, base64, threading, time, glob, sqlite3
 import numpy as np
 from PIL import Image
 import cv2
 import torch
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
-# ---- Tunables (safe to adjust; be ready to justify at the defense) ----
+# ---- Detection tunables ----
 MIN_COVERAGE_PERCENT   = 1.0
-SAMPLE_EVERY_N_FRAMES  = 15     # raise this on CPU to make video faster (fewer frames)
+SAMPLE_EVERY_N_FRAMES  = 15
 SEGMENT_GAP_TOLERANCE  = 1
 MAX_SAMPLE_FRAMES      = 4
 
@@ -53,7 +57,7 @@ def run_water_mask(pil_image):
     probs = cv2.resize(probs, (W, H), interpolation=cv2.INTER_LINEAR)
     return (probs > THRESHOLD).astype(np.uint8)
 
-# ================= helpers (no need to edit) =================
+# ================= helpers =================
 def coverage_percent(mask):
     total = mask.size
     return round(100.0 * float(mask.sum()) / total, 2) if total else 0.0
@@ -168,8 +172,7 @@ async def detect_image(file: UploadFile = File(...)):
         pil = Image.open(io.BytesIO(await file.read()))
     except Exception:
         return JSONResponse(status_code=400, content={
-            "status": "error",
-            "error": {"code": "invalid_file", "message": "Not a supported image."}})
+            "status": "error", "error": {"code": "invalid_file", "message": "Not a supported image."}})
     t0 = time.time()
     W, H = pil.size
     mask = run_water_mask(pil)
@@ -208,8 +211,7 @@ async def detect_video(file: UploadFile = File(...)):
             f.write(await file.read())
     except Exception:
         return JSONResponse(status_code=400, content={
-            "status": "error",
-            "error": {"code": "invalid_file", "message": "Could not read the video."}})
+            "status": "error", "error": {"code": "invalid_file", "message": "Could not read the video."}})
     JOBS[job_id] = {"status": "processing", "job_id": job_id,
                     "progress_percent": 0, "frames_processed": 0, "frames_total": 0}
     threading.Thread(target=_process_video_job, args=(job_id, path), daemon=True).start()
@@ -224,18 +226,65 @@ def get_job(job_id: str):
     return job
 
 # =====================================================================
-# CAMERAS — live monitoring simulation (round-robin worker)
-# Paste this whole block into main.py, right ABOVE the final
-# `if __name__ == "__main__":` line. Nothing else in main.py changes.
+# EVENT LOG (SQLite) — defined before the worker so it can log events
 # =====================================================================
-import glob
-from fastapi import Response
+EVENTS_DB = os.path.join(os.path.dirname(__file__), "events.db")
+_events_lock = threading.Lock()
 
-# ---- Config ----
-NUM_CAMERAS = 45                    # how many cameras to simulate
-CAMERA_OVERFLOW_THRESHOLD = 5.0     # coverage % above which a camera = "overflow"
-FRAME_STEP = 25                     # frames to advance each cycle (feed progresses)
-SLEEP_BETWEEN_CAMERAS = 1.0         # pause between cameras (paces the round-robin)
+def _init_events_db():
+    conn = sqlite3.connect(EVENTS_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            camera_id TEXT,
+            camera_name TEXT,
+            place TEXT,
+            reference TEXT,
+            coverage_percent REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+_init_events_db()
+
+def log_event(cam, coverage):
+    try:
+        with _events_lock:
+            conn = sqlite3.connect(EVENTS_DB)
+            conn.execute(
+                "INSERT INTO events (timestamp, camera_id, camera_name, place, reference, coverage_percent) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), cam["id"], cam["name"], cam["place"], cam["reference"], round(coverage, 2)),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print("[events] log error:", e)
+
+@app.get("/events")
+def list_events(q: str = "", limit: int = 100):
+    conn = sqlite3.connect(EVENTS_DB)
+    conn.row_factory = sqlite3.Row
+    if q:
+        like = f"%{q}%"
+        rows = conn.execute(
+            "SELECT * FROM events WHERE camera_name LIKE ? OR place LIKE ? OR reference LIKE ? "
+            "ORDER BY id DESC LIMIT ?", (like, like, like, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return {"events": [dict(r) for r in rows], "count": len(rows)}
+
+# =====================================================================
+# CAMERAS — live monitoring simulation (round-robin worker)
+# =====================================================================
+NUM_CAMERAS = 45
+CAMERA_OVERFLOW_THRESHOLD = 5.0
+FRAME_STEP = 25
+SLEEP_BETWEEN_CAMERAS = 1.0
 
 VIDEO_DIR = os.path.join(os.path.dirname(__file__), "videos")
 
@@ -263,17 +312,17 @@ def _build_cameras():
             "status": "unknown",
             "coverage_percent": 0.0,
             "updated_at": 0.0,
-            "frame_pos": (i * 40),      # staggered start so cameras aren't identical
+            "frame_pos": (i * 40),
         })
     return cams
 
 CAMERAS = _build_cameras()
-CAMERA_FRAMES = {}          # cam_id -> latest annotated JPEG bytes
+CAMERA_FRAMES = {}
 _cam_lock = threading.Lock()
 
 def _camera_worker():
     if not any(c["video"] for c in CAMERAS):
-        print("[cameras] no videos found in", VIDEO_DIR, "- worker idle (statuses stay 'unknown')")
+        print("[cameras] no videos found in", VIDEO_DIR, "- worker idle")
         return
     print(f"[cameras] worker started for {len(CAMERAS)} cameras")
     while True:
@@ -296,12 +345,18 @@ def _camera_worker():
                 overlay = make_overlay(pil, mask)
                 bgr = cv2.cvtColor(np.array(overlay), cv2.COLOR_RGB2BGR)
                 ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+
+                new_status = "overflow" if cov >= CAMERA_OVERFLOW_THRESHOLD else "normal"
+                prev_status = cam["status"]
                 with _cam_lock:
                     if ok:
                         CAMERA_FRAMES[cam["id"]] = buf.tobytes()
                     cam["coverage_percent"] = cov
-                    cam["status"] = "overflow" if cov >= CAMERA_OVERFLOW_THRESHOLD else "normal"
+                    cam["status"] = new_status
                     cam["updated_at"] = time.time()
+                if prev_status != "overflow" and new_status == "overflow":
+                    log_event(cam, cov)
+
                 cam["frame_pos"] = pos + FRAME_STEP
             except Exception as e:
                 print("[cameras] error on", cam["id"], e)
@@ -331,6 +386,14 @@ def camera_frame(cam_id: str):
         return JSONResponse(status_code=404, content={
             "status": "error", "error": {"code": "no_frame", "message": "No frame yet."}})
     return Response(content=data, media_type="image/jpeg")
+
+@app.get("/cameras/{cam_id}/video")
+def camera_video(cam_id: str):
+    cam = next((c for c in CAMERAS if c["id"] == cam_id), None)
+    if cam is None or not cam.get("video") or not os.path.exists(cam["video"]):
+        return JSONResponse(status_code=404, content={
+            "status": "error", "error": {"code": "no_video", "message": "No video for this camera."}})
+    return FileResponse(cam["video"], media_type="video/mp4")
 
 if __name__ == "__main__":
     import uvicorn
